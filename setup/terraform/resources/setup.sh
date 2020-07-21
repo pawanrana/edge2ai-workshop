@@ -10,19 +10,50 @@ if [ "$USER" != "root" ]; then
   exit 1
 fi
 
+#########  Set variables upfront
+
 CLOUD_PROVIDER=${1:-aws}
 SSH_USER=${2:-}
 SSH_PWD=${3:-}
 NAMESPACE=${4:-}
 DOCKER_DEVICE=${5:-}
+export NAMESPACE DOCKER_DEVICE
 
-export NAMESPACE
+BASE_DIR=$(cd "$(dirname $0)"; pwd -L)
+# Save params
+if [[ ! -f $BASE_DIR/.setup.params ]]; then
+  echo "bash -x $0 '$CLOUD_PROVIDER' '$SSH_USER' '$SSH_PWD' '$NAMESPACE' '$DOCKER_DEVICE'" > $BASE_DIR/.setup.params
+fi
 
-BASE_DIR=$(cd $(dirname $0); pwd -L)
 source $BASE_DIR/common.sh
 KEY_FILE=${BASE_DIR}/myRSAkey
+TEMPLATE_FILE=$BASE_DIR/cluster_template.${NAMESPACE}.json
 
 load_stack $NAMESPACE
+
+CM_REPO_FILE=/etc/yum.repos.d/cloudera-manager.repo
+
+export PUBLIC_IP=$(curl https://ifconfig.me 2>/dev/null || curl https://api.ipify.org/ 2> /dev/null)
+if [[ ! $PUBLIC_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+  echo "ERROR: Could not retrieve public IP for this instance. Probably a transient error. Please try again."
+  exit 1
+fi
+export PUBLIC_DNS=$(curl http://169.254.169.254/latest/meta-data/public-hostname)
+if [ "$PUBLIC_DNS" == "" ]; then
+  echo "ERROR: Could not retrieve public DNS for this instance. Probably a transient error. Please try again."
+  exit 1
+fi
+export PRIVATE_DNS=$(curl http://169.254.169.254/latest/meta-data/local-hostname)
+export CLUSTER_HOST=$PUBLIC_DNS
+export CDSW_DOMAIN=cdsw.${PUBLIC_IP}.nip.io
+export PRIVATE_IP=$(hostname -I | tr -d '[:space:]')
+
+function enable_py3() {
+  if [[ $(which python) != /opt/rh/rh-python36/root/usr/bin/python ]]; then
+    export MANPATH=
+    source /opt/rh/rh-python36/enable
+  fi
+}
 
 #########  Start Packer Installation
 
@@ -41,32 +72,54 @@ else
 fi
 
 echo "-- Testing if this is a pre-packed image by looking for existing Cloudera Manager repo"
-CM_REPO_FILE=/etc/yum.repos.d/cloudera-manager.repo
 if [[ ! -f $CM_REPO_FILE ]]; then
   echo "-- Cloudera Manager repo not found, assuming not prepacked"
+  echo "-- Installing EPEL repo"
+  yum_install epel-release
+  # The EPEL repo has intermittent refresh issues that cause errors like the one below.
+  # Switch to baseurl to avoid those issues when using the metalink option.
+  # Error: https://.../repomd.xml: [Errno -1] repomd.xml does not match metalink for epel
+  sed -i 's/metalink=/#metalink=/;s/#*baseurl=/baseurl=/' /etc/yum.repos.d/epel*.repo
+  yum clean all
+  rm -rf /var/cache/yum/
+  set +e
+  yum repolist
+  RET=$?
+  set -e
+  if [[ $RET != 0 ]]; then
+    # baseurl failed, so we'll revert to the original metalink
+    sed -i 's/#*metalink=/metalink=/;s/baseurl=/#baseurl=/' /etc/yum.repos.d/epel*.repo
+    yum repolist
+  fi
+
   echo "-- Installing base dependencies"
-  yum_install ${JAVA_PACKAGE_NAME} vim wget curl git bind-utils epel-release centos-release-scl
+  yum_install ${JAVA_PACKAGE_NAME} vim wget curl git bind-utils centos-release-scl figlet cowsay
   yum_install npm gcc-c++ make shellinabox mosquitto jq transmission-cli rng-tools rh-python36 httpd
 
   echo "-- Install CM repo"
   if [ "${CM_REPO_AS_TARBALL_URL:-}" == "" ]; then
-    wget --progress=dot:giga $wget_basic_auth ${CM_REPO_FILE_URL} -O $CM_REPO_FILE
+    retry_if_needed 5 5 "wget --progress=dot:giga $wget_basic_auth '${CM_REPO_FILE_URL}' -O '$CM_REPO_FILE'"
     sed -i -E "s#https?://[^/]*#${CM_BASE_URL}#g" $CM_REPO_FILE
   else
     sed -i.bak 's/^ *Listen  *.*/Listen 3333/' /etc/httpd/conf/httpd.conf
     systemctl start httpd
 
     CM_REPO_AS_TARBALL_FILE=/tmp/cm-repo-as-a-tarball.tar.gz
-    wget --progress=dot:giga $wget_basic_auth "${CM_REPO_AS_TARBALL_URL}" -O $CM_REPO_AS_TARBALL_FILE
+    retry_if_needed 5 5 "wget --progress=dot:giga $wget_basic_auth '${CM_REPO_AS_TARBALL_URL}' -O '$CM_REPO_AS_TARBALL_FILE'"
     tar -C /var/www/html -xvf $CM_REPO_AS_TARBALL_FILE
     CM_REPO_ROOT_DIR=$(tar -tvf $CM_REPO_AS_TARBALL_FILE | head -1 | awk '{print $NF}')
+    if [[ $CM_MAJOR_VERSION == 5 ]]; then
+      CM_REPO_ROOT_DIR=${CM_REPO_ROOT_DIR}/${CM_VERSION}
+    fi
     rm -f $CM_REPO_AS_TARBALL_FILE
 
-    # In some versions the allkeys.asc file is missing from the repo-as-tarball
-    KEYS_FILE=/var/www/html/${CM_REPO_ROOT_DIR}/allkeys.asc
-    if [ ! -f "$KEYS_FILE" ]; then
-      KEYS_URL="$(dirname $(dirname "$CM_REPO_AS_TARBALL_URL"))/allkeys.asc"
-      wget --progress=dot:giga $wget_basic_auth "${KEYS_URL}" -O $KEYS_FILE
+    if [[ $CM_MAJOR_VERSION != 5 ]]; then
+      # In some versions the allkeys.asc file is missing from the repo-as-tarball
+      KEYS_FILE=/var/www/html/${CM_REPO_ROOT_DIR}/allkeys.asc
+      if [ ! -f "$KEYS_FILE" ]; then
+        KEYS_URL="$(dirname "$(dirname "$CM_REPO_AS_TARBALL_URL")")/allkeys.asc"
+        retry_if_needed 5 5 "wget --progress=dot:giga $wget_basic_auth '${KEYS_URL}' -O '$KEYS_FILE'"
+      fi
     fi
 
     cat > /etc/yum.repos.d/cloudera-manager.repo <<EOF
@@ -92,14 +145,26 @@ EOF
   systemctl disable cloudera-scm-agent
   systemctl disable cloudera-scm-server
 
+  echo "-- Hack KNOX CSD to include [knoxsso.cookie.domain.suffix] property"
+  KNOX_CSD=/opt/cloudera/cm/csd/KNOX-${CM_VERSION}.jar
+  if [[ -f $KNOX_CSD ]]; then
+    mkdir -p /tmp/knoxcsd
+    pushd /tmp/knoxcsd
+    jar xvf $KNOX_CSD
+    if [[ -f aux/descriptors/knoxsso.json ]]; then
+      sed -i.bak 's/knoxsso.token.ttl/knoxsso.cookie.domain.suffix": "*", "knoxsso.token.ttl/' aux/descriptors/knoxsso.json
+    fi
+    jar cvf $KNOX_CSD *
+    popd
+  fi
+
   echo "-- Install and disable PostgreSQL"
   yum_install postgresql10-server postgresql10 postgresql-jdbc
   systemctl disable postgresql-10
 
   echo "-- Handle additional installs"
   npm install --quiet forever -g
-  export MANPATH=
-  source /opt/rh/rh-python36/enable
+  enable_py3
   pip install --quiet --upgrade pip
   pip install --progress-bar off cm_client paho-mqtt pytest nipyapi psycopg2-binary pyyaml jinja2 impyla
   ln -s /opt/rh/rh-python36/root/bin/python3 /usr/bin/python3
@@ -110,29 +175,28 @@ EOF
   chmod 644 /usr/share/java/postgresql-connector-java.jar
 
   echo "-- Install Maven"
-  curl "$MAVEN_BINARY_URL" > /tmp/apache-maven-bin.tar.gz
+  retry_if_needed 5 5 "curl '$MAVEN_BINARY_URL' > /tmp/apache-maven-bin.tar.gz"
 
-  tar -C $(get_homedir $SSH_USER) -zxvf /tmp/apache-maven-bin.tar.gz
+  tar -C "$(get_homedir $SSH_USER)" -zxvf /tmp/apache-maven-bin.tar.gz
   rm -f /tmp/apache-maven-bin.tar.gz
-  MAVEN_BIN=$(ls -d1tr $(get_homedir $SSH_USER)/apache-maven-*/bin | tail -1)
-  echo "export PATH=\$PATH:$MAVEN_BIN" >> $(get_homedir $SSH_USER)/.bash_profile
+  MAVEN_BIN=$(ls -d1tr "$(get_homedir $SSH_USER)"/apache-maven-*/bin | tail -1)
+  echo "export PATH=\$PATH:$MAVEN_BIN" >> "$(get_homedir $SSH_USER)"/.bash_profile
 
   echo "-- Get and extract CEM tarball to /opt/cloudera/cem"
   mkdir -p /opt/cloudera/cem
   if [ "$CEM_URL" != "" ]; then
     CEM_TARBALL_NAME=$(basename ${CEM_URL%%\?*})
     CEM_TARBALL_PATH=/opt/cloudera/cem/${CEM_TARBALL_NAME}
-    wget --progress=dot:giga $wget_basic_auth "${CEM_URL}" -O $CEM_TARBALL_PATH
+    retry_if_needed 5 5 "wget --progress=dot:giga $wget_basic_auth '${CEM_URL}' -O '$CEM_TARBALL_PATH'"
     tar -zxf $CEM_TARBALL_PATH -C /opt/cloudera/cem
     rm -f $CEM_TARBALL_PATH
   else
     for url in "$EFM_TARBALL_URL" "$MINIFITK_TARBALL_URL" "$MINIFI_TARBALL_URL"; do
       TARBALL_NAME=$(basename ${url%%\?*})
       TARBALL_PATH=/opt/cloudera/cem/${TARBALL_NAME}
-      wget --progress=dot:giga $wget_basic_auth "${url}" -O $TARBALL_PATH
+      retry_if_needed 5 5 "wget --progress=dot:giga $wget_basic_auth '${url}' -O '$TARBALL_PATH'"
     done
   fi
-
 
   echo "-- Install and configure EFM"
   EFM_TARBALL=$(find /opt/cloudera/cem/ -name "efm-*-bin.tar.gz")
@@ -140,11 +204,22 @@ EOF
   tar -zxf ${EFM_TARBALL} -C /opt/cloudera/cem
   ln -s /opt/cloudera/cem/${EFM_BASE_NAME} /opt/cloudera/cem/efm
   ln -s /opt/cloudera/cem/efm/bin/efm.sh /etc/init.d/efm
+  sed -i '1s/.*/&\n# chkconfig: 2345 20 80\n# description: EFM is a Command \& Control service for managing MiNiFi deployments/' /opt/cloudera/cem/efm/bin/efm.sh
+  chkconfig --add efm
   chown -R root:root /opt/cloudera/cem/${EFM_BASE_NAME}
-  rm -f /opt/cloudera/cem/efm/conf/efm.properties
-  rm -f /opt/cloudera/cem/efm/conf/efm.conf
-  cp $BASE_DIR/efm.properties /opt/cloudera/cem/efm/conf
-  cp $BASE_DIR/efm.conf /opt/cloudera/cem/efm/conf
+  sed -i.bak 's#APP_EXT_LIB_DIR=.*#APP_EXT_LIB_DIR=/usr/share/java#' /opt/cloudera/cem/efm/conf/efm.conf
+  sed -i.bak \
+'s#^efm.server.address=.*#efm.server.address=edge2ai-1.dim.local#;'\
+'s#^efm.security.user.certificate.enabled=.*#efm.security.user.certificate.enabled=false#;'\
+'s#^efm.nifi.registry.enabled=.*#efm.nifi.registry.enabled=true#;'\
+'s#^efm.nifi.registry.url=.*#efm.nifi.registry.url=http://edge2ai-1.dim.local:18080#;'\
+'s#^efm.nifi.registry.bucketName=.*#efm.nifi.registry.bucketName=IoT#;'\
+'s#^efm.heartbeat.maxAgeToKeep=.*#efm.heartbeat.maxAgeToKeep=1h#;'\
+'s#^efm.event.maxAgeToKeep.debug=.*#efm.event.maxAgeToKeep.debug=5m#;'\
+'s#^efm.db.url=.*#efm.db.url=jdbc:postgresql://edge2ai-1.dim.local:5432/efm#;'\
+'s#^efm.db.driverClass=.*#efm.db.driverClass=org.postgresql.Driver#;'\
+'s#^efm.db.password=.*#efm.db.password=supersecret1#' /opt/cloudera/cem/efm/conf/efm.properties
+  echo -e "\nefm.encryption.password=supersecret1supersecret1" >> /opt/cloudera/cem/efm/conf/efm.properties
 
   echo "-- Install and configure MiNiFi"
   MINIFI_TARBALL=$(find /opt/cloudera/cem/ -name "minifi-[0-9]*-bin.tar.gz")
@@ -164,7 +239,7 @@ EOF
   systemctl disable minifi
 
   echo "-- Download and install MQTT Processor NAR file"
-  wget --progress=dot:giga https://repo1.maven.org/maven2/org/apache/nifi/nifi-mqtt-nar/1.8.0/nifi-mqtt-nar-1.8.0.nar -P /opt/cloudera/cem/minifi/lib
+  retry_if_needed 5 5 "wget --progress=dot:giga https://repo1.maven.org/maven2/org/apache/nifi/nifi-mqtt-nar/1.8.0/nifi-mqtt-nar-1.8.0.nar -P /opt/cloudera/cem/minifi/lib"
   chown root:root /opt/cloudera/cem/minifi/lib/nifi-mqtt-nar-1.8.0.nar
   chmod 660 /opt/cloudera/cem/minifi/lib/nifi-mqtt-nar-1.8.0.nar
 
@@ -183,7 +258,7 @@ EOF
       echo ">>> $component - $version - $url"
       # Download parcel manifest
       manifest_url="$(check_for_presigned_url "${url%%/}/manifest.json")"
-      curl $curl_basic_auth --silent "$manifest_url" > /tmp/manifest.json
+      retry_if_needed 5 5 "curl --referer '${BASE_URI%/}/' $curl_basic_auth --silent '$manifest_url' > /tmp/manifest.json"
       # Find the parcel name for the specific component and version
       parcel_name=$(jq -r '.parcels[] | select(.parcelName | contains("'"$version"'-el7.parcel")) | select(.components[] | .name == "'"$component"'").parcelName' /tmp/manifest.json)
       # Create the hash file
@@ -191,7 +266,7 @@ EOF
       echo "$hash" > "/opt/cloudera/parcel-repo/${parcel_name}.sha"
       # Download the parcel file - in the background
       parcel_url="$(check_for_presigned_url "${url%%/}/${parcel_name}")"
-      wget --no-clobber --progress=dot:giga $wget_basic_auth "${parcel_url}" -O "/opt/cloudera/parcel-repo/${parcel_name}" &
+      retry_if_needed 5 5 "wget --referer='${BASE_URI%/}/' --continue --progress=dot:giga $wget_basic_auth '${parcel_url}' -O '/opt/cloudera/parcel-repo/${parcel_name}'" &
     done
     wait
     # Create the torrent file for the parcel
@@ -224,7 +299,7 @@ EOF
     else
       auth=""
     fi
-    wget --progress=dot:giga $wget_basic_auth "${url}" -O /opt/cloudera/csd/${file_name}
+    retry_if_needed 5 5 "wget --referer='${BASE_URI%/}/' --progress=dot:giga $wget_basic_auth '${url}' -O '/opt/cloudera/csd/${file_name}'"
     # Patch CDSW CSD so that we can use it on CDP
     if [ "${HAS_CDSW:-1}" == "1" -a "$url" == "$CDSW_CSD_URL" -a "$CM_MAJOR_VERSION" == "7" ]; then
       jar xvf /opt/cloudera/csd/CLOUDERA_DATA_SCIENCE_WORKBENCH-*.jar descriptor/service.sdl
@@ -267,8 +342,7 @@ systemctl enable rngd
 systemctl start rngd
 
 # Enable Python3
-export MANPATH=
-source /opt/rh/rh-python36/enable
+enable_py3
 
 echo "-- Configure kernel parameters"
 echo never > /sys/kernel/mm/transparent_hugepage/enabled
@@ -318,18 +392,21 @@ case "${CLOUD_PROVIDER}" in
           exit 1
 esac
 
-PUBLIC_IP=$(curl https://api.ipify.org/ 2>/dev/null || curl https://ifconfig.me 2> /dev/null)
-PUBLIC_DNS=$(dig -x ${PUBLIC_IP} +short | sed 's/\.$//')
-
 echo "-- Set /etc/hosts - Public DNS must come first"
-echo "$(hostname -I) $PUBLIC_DNS $(hostname -f) edge2ai-1.dim.local" >> /etc/hosts
+echo "$PRIVATE_IP $PUBLIC_DNS $PRIVATE_DNS edge2ai-1.dim.local" >> /etc/hosts
 
 echo "-- Configure networking"
-hostnamectl set-hostname $PUBLIC_DNS
+hostnamectl set-hostname ${CLUSTER_HOST}
 if [[ -f /etc/sysconfig/network ]]; then
   sed -i "/HOSTNAME=/ d" /etc/sysconfig/network
 fi
-echo "HOSTNAME=$PUBLIC_DNS" >> /etc/sysconfig/network
+echo "HOSTNAME=${CLUSTER_HOST}" >> /etc/sysconfig/network
+
+# Create certs is TLS is enabled
+if [[ $ENABLE_TLS == yes ]]; then
+  create_ca
+  create_certs
+fi
 
 echo "-- Generate self-signed certificate for ShellInABox with the needed SAN entries"
 # Generate self-signed certificate for ShellInABox with the needed SAN entries
@@ -340,7 +417,7 @@ openssl req \
   -keyout key.pem \
   -out cert.pem \
   -days 365 \
-  -subj "/C=US/ST=California/L=San Francisco/O=Cloudera/OU=Data in Motion/CN=$(hostname -f)" \
+  -subj "/C=US/ST=California/L=San Francisco/O=Cloudera/OU=Data in Motion/CN=${CLUSTER_HOST}" \
   -extensions 'v3_user_req' \
   -config <( cat <<EOF
 [ req ]
@@ -364,7 +441,7 @@ basicConstraints = CA:FALSE
 subjectKeyIdentifier = hash
 keyUsage = digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth, clientAuth
-subjectAltName = DNS:$(hostname -f),IP:$(hostname -I),IP:${PUBLIC_IP},DNS:edge2ai-1.dim.local
+subjectAltName = DNS:${CLUSTER_HOST},IP:${PRIVATE_IP},IP:${PUBLIC_IP},DNS:edge2ai-1.dim.local
 EOF
 )
 cat key.pem cert.pem > /var/lib/shellinabox/certificate.pem
@@ -408,7 +485,7 @@ echo 'LC_ALL="en_US.UTF-8"' >> /etc/locale.conf
 sed -i '/host *all *all *127.0.0.1\/32 *ident/ d' /var/lib/pgsql/10/data/pg_hba.conf
 cat >> /var/lib/pgsql/10/data/pg_hba.conf <<EOF
 host all all 127.0.0.1/32 md5
-host all all $(hostname -I | sed 's/ //g')/32 md5
+host all all ${PRIVATE_IP}/32 md5
 host all all 127.0.0.1/32 ident
 host ranger rangeradmin 0.0.0.0/0 md5
 EOF
@@ -429,7 +506,12 @@ echo "-- Create DBs required by CM"
 sudo -u postgres psql < ${BASE_DIR}/create_db_pg.sql
 
 echo "-- Prepare CM database 'scm'"
-/opt/cloudera/cm/schema/scm_prepare_database.sh postgresql scm scm supersecret1
+if [[ $CM_MAJOR_VERSION != 5 ]]; then
+  SCM_PREP_DB=/opt/cloudera/cm/schema/scm_prepare_database.sh
+else
+  SCM_PREP_DB=/usr/share/cmf/schema/scm_prepare_database.sh
+fi
+$SCM_PREP_DB postgresql scm scm supersecret1
 
 echo "-- Install additional CSDs"
 for csd in $(find $BASE_DIR/csds -name "*.jar"); do
@@ -472,19 +554,22 @@ if [ "$(is_kerberos_enabled)" == "yes" ]; then
   install_kerberos
 fi
 
-echo "-- Wait for CM to be ready before proceeding"
-until $(curl --output /dev/null --silent --head --fail -u "admin:admin" http://localhost:7180/api/version); do
-  echo "waiting 10s for CM to come up.."
-  sleep 10
-done
-echo "-- CM has finished starting"
+# Add users - after Kerberos installation so that principals are also created correctly, if needed
+add_user workshop users
+add_user admin admins,shadow
+add_user alice users
+add_user bob users
+
+# Set shadow permissions - needed by Knox when using PAM authentication
+chgrp shadow /etc/shadow
+chmod g+r /etc/shadow
+usermod -G knox,hadoop,shadow knox || true
+id knox > /dev/null 2>&1 && usermod -G knox,hadoop,shadow knox || echo "User knox does not exist. Skipping usermod"
+
+wait_for_cm
 
 echo "-- Generate cluster template"
-TEMPLATE_FILE=$BASE_DIR/cluster_template.${NAMESPACE}.json
-export CDSW_DOMAIN=cdsw.${PUBLIC_IP}.nip.io
-export CLUSTER_HOST=$(hostname -f)
-export PRIVATE_IP=$(hostname -I | tr -d '[:space:]')
-export DOCKER_DEVICE PUBLIC_DNS
+enable_py3
 python $BASE_DIR/cm_template.py --cdh-major-version $CDH_MAJOR_VERSION $CM_SERVICES > $TEMPLATE_FILE
 
 echo "-- Create cluster"
@@ -494,8 +579,61 @@ else
   KERBEROS_OPTION=""
 fi
 CM_REPO_URL=$(grep baseurl $CM_REPO_FILE | sed 's/.*=//;s/ //g')
-export CM_MAJOR_VERSION REMOTE_REPO_USR REMOTE_REPO_PWD
-python $BASE_DIR/create_cluster.py $KERBEROS_OPTION $(hostname -f) $TEMPLATE_FILE $KEY_FILE $CM_REPO_URL
+# In case this is a re-run and TLS was already enabled, provide the TLS truststore option
+TRUSTSTORE_OPTION=$([[ $(netstat -anp | grep ':7183 .*LISTEN ' | wc -l) > 0 ]] && echo "--tls-ca-cert /opt/cloudera/security/x509/truststore.pem" || echo "")
+if [ "$(is_tls_enabled)" != "yes" ]; then
+  python $BASE_DIR/create_cluster.py ${CLUSTER_HOST} \
+    $TRUSTSTORE_OPTION \
+    --setup-cm \
+      --key-file $KEY_FILE \
+      --cm-repo-url $CM_REPO_URL \
+      $KERBEROS_OPTION \
+    --create-cluster \
+      --template $TEMPLATE_FILE
+else
+  python $BASE_DIR/create_cluster.py ${CLUSTER_HOST} \
+    $TRUSTSTORE_OPTION \
+    --setup-cm \
+      --key-file $KEY_FILE \
+      --cm-repo-url $CM_REPO_URL \
+      --use-tls \
+      $KERBEROS_OPTION
+
+  # Restart CM
+  systemctl restart cloudera-scm-server
+  # Reconfigure agent
+  sed -i.bak \
+"s%^[# ]*server_host=.*%server_host=${CLUSTER_HOST}%;"\
+'s%^[# ]*use_tls=.*%use_tls=1%;'\
+'s%^[# ]*verify_cert_file=.*%verify_cert_file=/opt/cloudera/security/x509/truststore.pem%;'\
+'s%^[# ]*client_key_file=.*%client_key_file=/opt/cloudera/security/x509/key.pem%;'\
+'s%^[# ]*client_keypw_file=.*%client_keypw_file=/opt/cloudera/security/x509/pwfile%;'\
+'s%^[# ]*client_cert_file=.*%client_cert_file=/opt/cloudera/security/x509/cert.pem%'\
+     /etc/cloudera-scm-agent/config.ini
+  # Restart agent
+  systemctl restart cloudera-scm-agent
+  # Wait for CM to be ready
+  wait_for_cm
+
+  python $BASE_DIR/create_cluster.py ${CLUSTER_HOST} \
+    --create-cluster \
+      --template $TEMPLATE_FILE \
+      --tls-ca-cert /opt/cloudera/security/x509/truststore.pem
+fi
+
+echo "-- Ensure Zepellin is on the shadow group for PAM auth to work (service needs restarting)"
+id zeppelin > /dev/null 2>&1 && usermod -G shadow zeppelin || echo "User zeppelin does not exist. Skipping usermod"
+curl -k -L -X POST -u admin:admin "http://${CLUSTER_HOST}:7180/api/v19/clusters/OneNodeCluster/services/zeppelin/commands/restart"
+
+echo "-- Tighten permissions"
+if [[ $ENABLE_TLS == yes ]]; then
+  tighten_keystores_permissions
+fi
+
+echo "-- Set Ranger policies for NiFi"
+if [[ ${HAS_RANGER:-0} == 1 && ${HAS_NIFI:-0} == 1 ]]; then
+  $BASE_DIR/ranger_policies.sh
+fi
 
 echo "-- Configure and start EFM"
 retries=0
@@ -536,13 +674,18 @@ systemctl start minifi
 if [[ ",${CM_SERVICES}," == *",KAFKA,"* ]]; then
   echo "-- Create Kafka topic (iot)"
   auth kafka
-  if [ "$(is_kerberos_enabled)" == "yes" ]; then
+  if [[ -f $KAFKA_CLIENT_PROPERTIES ]]; then
     CLIENT_CONFIG_OPTION="--command-config $KAFKA_CLIENT_PROPERTIES"
   else
     CLIENT_CONFIG_OPTION=""
   fi
-  kafka-topics $CLIENT_CONFIG_OPTION --bootstrap-server $(hostname -f):9092 --create --topic iot --partitions 10 --replication-factor 1
-  kafka-topics $CLIENT_CONFIG_OPTION --bootstrap-server $(hostname -f):9092 --describe --topic iot
+  if [ "$(is_tls_enabled)" == "yes" ]; then
+    KAFKA_PORT="9093"
+  else
+    KAFKA_PORT="9092"
+  fi
+  kafka-topics $CLIENT_CONFIG_OPTION --bootstrap-server ${CLUSTER_HOST}:${KAFKA_PORT} --create --topic iot --partitions 10 --replication-factor 1
+  kafka-topics $CLIENT_CONFIG_OPTION --bootstrap-server ${CLUSTER_HOST}:${KAFKA_PORT} --describe --topic iot
   unauth
 fi
 
@@ -571,6 +714,7 @@ fi
 echo "-- Cleaning up"
 rm -f $BASE_DIR/stack.*.sh*
 
+source /etc/workshop.conf
 echo "-- At this point you can login into Cloudera Manager host on port 7180 and follow the deployment of the cluster"
-
-# Finish install
+figlet -f small -w 300  "Cluster  ${CLUSTER_ID:-???}  deployed successfully"'!' | cowsay -n -f "$(ls -1 /usr/share/cowsay | grep "\.cow" | sed 's/\.cow//' | egrep -v "bong|head-in|sodomized|telebears" | shuf -n 1)"
+echo "Completed successfully: CLUSTER ${CLUSTER_ID:-???}"

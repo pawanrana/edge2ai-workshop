@@ -1,6 +1,16 @@
 #!/bin/bash
 BASE_DIR=$(cd $(dirname $0); pwd -L)
 source ${BASE_DIR}/common.sh
+check_version
+check_stack_version
+
+if [ $# != 1 ]; then
+  echo "Syntax: $0 <namespace>"
+  show_namespaces
+  abort
+fi
+NAMESPACE=$1
+LOG_NAME=$BASE_DIR/logs/setup.log.${NAMESPACE}.$(date +%Y%m%d%H%M%S)
 
 mkdir -p "${BASE_DIR}"/logs
 (
@@ -8,12 +18,6 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-if [ $# != 1 ]; then
-  echo "Syntax: $0 <namespace>"
-  show_namespaces
-  exit 1
-fi
-NAMESPACE=$1
 validate_env
 load_env $NAMESPACE
 check_python_modules
@@ -24,14 +28,14 @@ DATE_CHECK=$(remaining_days "$TF_VAR_enddate")
 if [ "$DATE_CHECK" -le "0" ]; then
   echo 'ERROR: The expiration date for your environment is either set for today or already in the past.'
   echo '       Please update "TF_VAR_endddate" in .env.'"$NAMESPACE"' and try again.'
-  exit 1
+  abort
 elif [ "$DATE_CHECK" -le "$WARNING_THRESHOLD_DAYS" ]; then
   echo -n "WARNING: Your environment will expire in less than $WARNING_THRESHOLD_DAYS days. Do you really want to continue? "
   read CONFIRM
   CONFIRM=$(echo "${CONFIRM}" | tr a-z A-Z)
   if [ "$CONFIRM" != "Y" -a "$CONFIRM" != "YES" ]; then
     echo 'Please update "TF_VAR_endddate" in .env.'"$NAMESPACE"' and try again.'
-    exit 1
+    abort
   fi
 fi
 
@@ -79,7 +83,7 @@ echo ""
 echo "Health checks:"
 "${BASE_DIR}/check-services.sh" "${NAMESPACE}"
 
-if [ "$TF_VAR_deploy_cdsw_model" == "true" ]; then
+if [[ ${HAS_CDSW:-0} == 1 && $TF_VAR_deploy_cdsw_model == true ]]; then
   echo "${C_YELLOW}    NOTE: CDSW model is being deployed in the background."
   echo "          Execute the following command later to check on the status of"
   echo "          CDSW and the Model deployment:"
@@ -95,4 +99,4 @@ END_TIME=$(date +%s)
 DURATION=$((END_TIME-START_TIME))
 log "Deployment completed in $(printf "%d:%02d" "$((DURATION/60))" "$((DURATION%60))") minutes"
 
-) 2>&1 | tee $BASE_DIR/logs/setup.log.${1:-unknown}.$(date +%Y%m%d%H%M%S)
+) 2>&1 | tee $LOG_NAME

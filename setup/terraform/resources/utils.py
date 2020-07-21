@@ -13,6 +13,7 @@ import os
 import sys
 from inspect import getmembers
 from contextlib import contextmanager
+from datetime import datetime
 from impala.dbapi import connect
 from nipyapi import config, canvas, versioning, nifi
 from nipyapi.nifi.rest import ApiException
@@ -39,6 +40,8 @@ _CDSW_USERNAME = 'admin'
 _CDSW_PASSWORD = 'supersecret1'
 _CDSW_FULL_NAME = 'Workshop Admin'
 _CDSW_EMAIL = 'admin@cloudera.com'
+
+_CDSW_SESSION = None
 
 PG_NAME = 'Process Sensor Data'
 
@@ -74,6 +77,14 @@ _DROP_KUDU_TABLE = "DROP TABLE IF EXISTS sensors;"
 # General helper functions
 
 
+def enable_debug():
+    LOG.setLevel(logging.DEBUG)
+
+
+def disable_debug():
+    LOG.setLevel(logging.INFO)
+
+
 def get_public_ip():
     retries = 3
     while retries > 0:
@@ -97,7 +108,7 @@ def exception_context(obj):
     try:
         yield
     except:
-        print('Exception context: %s' % (obj,))
+        print('%s - Exception context: %s' % (datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'), obj))
         raise
 
 
@@ -115,7 +126,7 @@ def retry_test(max_retries=0, wait_time_secs=0):
                     else:
                         retries += 1
                         time.sleep(wait_time_secs)
-                        print('Retry #%d' % (retries,))
+                        print('%s - Retry #%d' % (datetime.strftime(datetime.now(), '%Y-%m-%d %H:%M:%S'), retries))
         return wrapped_f
     return wrap
 
@@ -130,30 +141,49 @@ def get_cdsw_altus_api():
     return 'http://cdsw.%s.nip.io/api/altus-ds-1' % (get_public_ip(),)
 
 
+def get_model_endpoint():
+    return 'http://modelservice.cdsw.%s.nip.io/model' % (get_public_ip(),)
+
+
+def cdsw_session():
+    global _CDSW_SESSION
+    if not _CDSW_SESSION:
+        _CDSW_SESSION = requests.Session()
+        r = _CDSW_SESSION.post(get_cdsw_api() + '/authenticate', json={'login': _CDSW_USERNAME, 'password': _CDSW_PASSWORD})
+        _CDSW_SESSION.headers.update({'Authorization': 'Bearer ' + r.json()['auth_token']})
+    return _CDSW_SESSION
+
+def get_cdsw_model():
+    r = cdsw_session().post(get_cdsw_altus_api() + '/models/list-models', json={'projectOwnerName': 'admin', 'latestModelDeployment': True, 'latestModelBuild': True})
+    models = [m for m in r.json() if m['name'] == 'IoT Prediction Model']
+    model = None
+    for m in models:
+        if m['name'] == _CDSW_MODEL_NAME:
+            model = m
+    return model
+
+def deploy_cdsw_model(model):
+    r = cdsw_session().post(get_cdsw_altus_api() + '/models/deploy-model', json={
+             'modelBuildId': model['latestModelBuild']['id'],
+             'memoryMb': 4096,
+             'cpuMillicores': 1000,
+        })
+
 def get_cdsw_model_access_key():
-    def _open_cdsw_session():
-        s = requests.Session()
-        r = s.post(get_cdsw_api() + '/authenticate', json={'login': _CDSW_USERNAME, 'password': _CDSW_PASSWORD})
-        s.headers.update({'Authorization': 'Bearer ' + r.json()['auth_token']})
-        return s
-
-    def _get_cdsw_model(s):
-        r = s.post(get_cdsw_altus_api() + '/models/list-models', json={'projectOwnerName': 'admin', 'latestModelDeployment': True, 'latestModelBuild': True})
-        models = [m for m in r.json() if m['name'] == 'IoT Prediction Model']
-        model = None
-        for m in models:
-            if m['name'] == _CDSW_MODEL_NAME:
-                model = m
-        if not model:
-            raise RuntimeError('Model %s not found.' % (_CDSW_MODEL_NAME,))
-        return model
-
-    s = _open_cdsw_session()
     while True:
-        model = _get_cdsw_model(s)
-        if model['latestModelDeployment']['status'] == 'deployed':
+        model = get_cdsw_model()
+        if not model:
+            status = 'not created yet'
+        elif not 'latestModelDeployment' in model or not 'status' in model['latestModelDeployment']:
+            status = 'unknown'
+        elif model['latestModelDeployment']['status'] == 'deployed':
             return model['accessKey']
-        LOG.debug('Model not deployed yet. Waiting for deployment to finish.')
+        elif model['latestModelDeployment']['status'] == 'stopped':
+            deploy_cdsw_model(model)
+            status = 'stopped'
+        else:
+            status = model['latestModelDeployment']['status']
+        LOG.info('Model not deployed yet. Model status is currently "%s". Waiting for deployment to finish.', status)
         time.sleep(10)
 
 # Kudu helper functions
@@ -382,7 +412,8 @@ def efm_delete_all(flow_id):
             efm_delete_by_type(flow_id, conn, obj_type)
 
 
-def efm_create_connection(flow_id, pg_id, source_id, source_type, destination_id, destination_type, relationships, source_port=None, destination_port=None):
+def efm_create_connection(flow_id, pg_id, source_id, source_type, destination_id, destination_type, relationships, source_port=None, destination_port=None,
+                          name=None, flow_file_expiration=None):
     def _get_endpoint(endpoint_id, endpoint_type, endpoint_port):
         if endpoint_type == 'PROCESSOR':
             return {'id': endpoint_id, 'type': 'PROCESSOR'}
@@ -401,6 +432,10 @@ def efm_create_connection(flow_id, pg_id, source_id, source_type, destination_id
         'source': _get_endpoint(source_id, source_type, source_port),
         'destination': _get_endpoint(destination_id, destination_type, destination_port),
         'selectedRelationships': relationships,
+        'name': name,
+        'flowFileExpiration': flow_file_expiration,
+        'backPressureObjectThreshold': None,
+        'backPressureDataSizeThreshold': None,
       }
     }
     resp = efm_api_post(endpoint, requests.codes.created, headers={'Content-Type': 'application/json'}, json=body)
@@ -680,7 +715,7 @@ def lab2_edge_flow(env):
             'Max Queue Size': '60',
         })
     env.nifi_rpg = efm_create_remote_processor_group(env.flow_id, env.efm_pg_id, 'Remote PG', _NIFI_URL, 'HTTP', (100, 400))
-    env.consume_conn = efm_create_connection(env.flow_id, env.efm_pg_id, env.consume_mqtt, 'PROCESSOR', env.nifi_rpg, 'REMOTE_INPUT_PORT', ['Message'], destination_port=env.from_gw.id)
+    env.consume_conn = efm_create_connection(env.flow_id, env.efm_pg_id, env.consume_mqtt, 'PROCESSOR', env.nifi_rpg, 'REMOTE_INPUT_PORT', ['Message'], destination_port=env.from_gw.id, name='Sensor data', flow_file_expiration='60 seconds')
 
     # Create a bucket in NiFi Registry to save the edge flow versions
     if not versioning.get_registry_bucket('IoT'):
@@ -781,9 +816,9 @@ def lab6_expand_edge_flow(env):
         },
         auto_terminate=['error'])
     efm_delete_by_type(env.flow_id, env.consume_conn, 'connections')
-    env.consume_conn = efm_create_connection(env.flow_id, env.efm_pg_id, env.consume_mqtt, 'PROCESSOR', extract_proc, 'PROCESSOR', ['Message'])
-    extract_conn = efm_create_connection(env.flow_id, env.efm_pg_id, extract_proc, 'PROCESSOR', filter_proc, 'PROCESSOR', ['matched'])
-    filter_conn = efm_create_connection(env.flow_id, env.efm_pg_id, filter_proc, 'PROCESSOR', env.nifi_rpg, 'REMOTE_INPUT_PORT', ['unmatched'], destination_port=env.from_gw.id)
+    env.consume_conn = efm_create_connection(env.flow_id, env.efm_pg_id, env.consume_mqtt, 'PROCESSOR', extract_proc, 'PROCESSOR', ['Message'], name='Sensor data', flow_file_expiration='60 seconds')
+    extract_conn = efm_create_connection(env.flow_id, env.efm_pg_id, extract_proc, 'PROCESSOR', filter_proc, 'PROCESSOR', ['matched'], name='Extracted attributes', flow_file_expiration='60 seconds')
+    filter_conn = efm_create_connection(env.flow_id, env.efm_pg_id, filter_proc, 'PROCESSOR', env.nifi_rpg, 'REMOTE_INPUT_PORT', ['unmatched'], destination_port=env.from_gw.id, name='Valid data', flow_file_expiration='60 seconds')
 
     # Publish/version flow
     efm_publish_flow(env.flow_id, 'Second version - ' + str(env.run_id))

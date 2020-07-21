@@ -22,12 +22,76 @@
     {
       "refName": "schemaregistry",
       "serviceType": "SCHEMAREGISTRY",
+      "serviceConfigs": [
+{% if ENABLE_KERBEROS == 'yes' %}
+        {
+          "name": "kerberos.auth.enable",
+          "value": "true"
+        },
+{% endif %}
+{% if CM_VERSION is lt('7.1.1') %}
+        {
+          "name": "zookeeper_service",
+          "ref": "zookeeper"
+        }
+{% else %}
+        {
+          "name": "database_host",
+          "value": "{{CLUSTER_HOST}}"
+        },
+        {
+          "name": "database_name",
+          "value": "registry"
+        },
+        {
+          "name": "database_password",
+          "value": "supersecret1"
+        },
+        {
+          "name": "database_port",
+          "value": "5432"
+        },
+        {
+          "name": "database_type",
+          "value": "postgresql"
+        },
+        {
+          "name": "database_user",
+          "value": "registry"
+        }
+{% endif %}
+      ],
       "roleConfigGroups": [
         {
           "refName": "schemaregistry-SCHEMA_REGISTRY_SERVER-BASE",
           "roleType": "SCHEMA_REGISTRY_SERVER",
           "base": true,
           "configs": [
+{% if ENABLE_TLS == 'yes' %}
+            {
+              "name": "ssl_client_truststore_location",
+              "value": "/opt/cloudera/security/jks/truststore.jks"
+            },
+            {
+              "name": "ssl_client_truststore_password",
+              "value": "supersecret1"
+            },
+            {
+              "name": "ssl_enabled",
+              "value": "true"
+            },
+            {
+              "name": "ssl_server_keystore_location",
+              "value": "/opt/cloudera/security/jks/keystore.jks"
+            },
+            {
+              "name": "ssl_server_keystore_password",
+              "value": "supersecret1"
+            }
+{% endif %}
+{% if CM_VERSION is lt('7.1.1') and ENABLE_TLS == 'yes' %}
+            ,
+{% endif %}
 {% if CM_VERSION is lt('7.1.1') %}
             {
               "name" : "schema.registry.storage.connector.connectURI",
@@ -40,39 +104,6 @@
 {% endif %}
           ]
         }
-      ],
-      "serviceConfigs": [
-{% if CM_VERSION is lt('7.1.1') %}
-        {
-          "name": "zookeeper_service",
-          "ref": "zookeeper"
-        }
-{% else %}
-        {
-          "name": "database_host",
-          "value": "{{CLUSTER_HOST}}"
-        }
-        ,{
-          "name": "database_name",
-          "value": "registry"
-        }
-        ,{
-          "name": "database_password",
-          "value": "supersecret1"
-        }
-        ,{
-          "name": "database_port",
-          "value": "5432"
-        }
-        ,{
-          "name": "database_type",
-          "value": "postgresql"
-        }
-        ,{
-          "name": "database_user",
-          "value": "registry"
-        }
-{% endif %}
       ]
     }
   ]

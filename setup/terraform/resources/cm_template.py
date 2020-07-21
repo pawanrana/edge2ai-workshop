@@ -31,7 +31,7 @@ def to_int(x):
         return 999
 
 def parse_version(ver):
-    return [to_int(x) for x in ver.split('.')]
+    return [to_int(x) for x in re.split('[-.]', ver)]
 
 def ge(v1, v2):
     if parse_version(v1) >= parse_version(v2):
@@ -111,6 +111,7 @@ def update_list(base, template, breadcrumbs=''):
                     update_dict(namesake[0], item, breadcrumbs + '/[' + idempotent_id + '=' + item[idempotent_id] + ']')
                     continue
         base.append(item)
+    base.sort(key=lambda x: json.dumps(x, sort_keys=True))
 
 def load_template(json_file, configs):
     template = jinja2_env().get_template(json_file)
@@ -170,7 +171,7 @@ def parse_args():
                       dest='cdh_major_version',
                       metavar='VERSION',
                       help='Major version of the CDH cluster for which the template will be generated. '
-                           'Valid values: 6 and 7')
+                           'Valid values: 5, 6 and 7')
     parser.add_option('--validate-only', action='store_true',
                       dest='validate_only',
                       help='Only validate if the specified services are valid.')
@@ -224,7 +225,7 @@ def get_template(template_names, config_file):
     for template_name in template_names:
         chosen_templates.append(load_template(TEMPLATES[template_name], configs))
     merged = merge_templates(chosen_templates)
-    return json.dumps(merged, indent=2)
+    return json.dumps(merged, indent=2, sort_keys=True)
 
 def main():
     (options, args) = parse_args()
@@ -235,9 +236,9 @@ def main():
     load_templates(options.template_dir)
 
     if options.cdh_major_version is None:
-        LOG.error('The --cdh-major-version must be specified. Valid values are: 6 and 7')
+        LOG.error('The --cdh-major-version must be specified. Valid values are: 5, 6 and 7')
         exit(1)
-    elif options.cdh_major_version not in ['6', '7']:
+    elif options.cdh_major_version not in ['5', '6', '7']:
         LOG.error('The only valid values for --cdh-major-version are 6 and 7')
         exit(1)
     os.environ['CDH_MAJOR_VERSION'] = options.cdh_major_version

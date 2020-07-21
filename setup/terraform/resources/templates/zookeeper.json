@@ -11,11 +11,72 @@
     {
       "serviceType": "ZOOKEEPER",
       "refName": "zookeeper",
+      "serviceConfigs": [
+{% if ENABLE_TLS == 'yes' and CDH_VERSION is ge('7.1') %}
+            {
+              "name": "zookeeper_tls_enabled",
+              "value": "true"
+            },
+            {
+              "name": "zookeeper_tls_keystore",
+              "value": "/opt/cloudera/security/jks/keystore.jks"
+            },
+            {
+              "name": "zookeeper_tls_keystore_password",
+              "value": "supersecret1"
+            },
+            {
+              "name": "zookeeper_tls_truststore",
+              "value": "/opt/cloudera/security/jks/truststore.jks"
+            },
+            {
+              "name": "zookeeper_tls_truststore_password",
+              "value": "supersecret1"
+            }
+{% endif %}
+{% if ENABLE_KERBEROS == 'yes' and ENABLE_TLS == 'yes' and CDH_VERSION is ge('7.1') %}
+        ,
+{% endif %}
+{% if ENABLE_KERBEROS == 'yes' %}
+        {
+          "name": "enableSecurity",
+          "value": "true"
+        },
+        {
+          "name": "quorum_auth_enable_sasl",
+          "value": "true"
+        }
+{% endif %}
+      ],
       "roleConfigGroups": [
         {
           "refName": "zookeeper-SERVER-BASE",
           "roleType": "SERVER",
-          "base": true
+          "base": true,
+          "configs": [
+{% if ENABLE_TLS == 'yes' %}
+            {
+              "name": "jmx_tls_enabled",
+              "value": "true"
+            },
+            {
+              "name": "jmx_tls_keystore",
+              "value": "/opt/cloudera/security/jks/keystore.jks"
+            },
+            {
+              "name": "jmx_tls_keystore_password",
+              "value": "supersecret1"
+            },
+            {
+              "name": "jmx_tls_truststore",
+              "value": "/opt/cloudera/security/jks/truststore.jks"
+            },
+            {
+              "name": "jmx_tls_truststore_password",
+              "value": "supersecret1"
+            }
+{% endif %}
+          ]
         }
       ]
     }

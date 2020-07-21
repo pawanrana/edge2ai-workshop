@@ -1,6 +1,12 @@
 #!/bin/bash
 
 DEFAULT_DOCKER_IMAGE=asdaraujo/edge2ai-workshop:latest
+GITHUB_REPO=asdaraujo/edge2ai-workshop
+GITHUB_BRANCH=master
+
+BUILD_FILE=.build
+STACK_BUILD_FILE=.stack.build
+LAST_STACK_CHECK_FILE=$BASE_DIR/.last.stack.build.check
 
 # Color codes
 C_NORMAL="$(echo -e "\033[0m")"
@@ -8,9 +14,125 @@ C_BOLD="$(echo -e "\033[1m")"
 C_DIM="$(echo -e "\033[2m")"
 C_RED="$(echo -e "\033[31m")"
 C_YELLOW="$(echo -e "\033[33m")"
+C_BLUE="$(echo -e "\033[34m")"
+C_WHITE="$(echo -e "\033[97m")"
+C_BG_RED="$(echo -e "\033[101m")"
+C_BG_MAGENTA="$(echo -e "\033[105m")"
 
 function log() {
   echo "[$(date)] [$(basename $0): $BASH_LINENO] : $*"
+}
+
+function abort() {
+  echo "Aborting."
+  exit 1
+}
+
+function check_version() {
+  if [[ ! -f $BASE_DIR/NO_VERSION_CHECK ]]; then
+
+    # First, try automated refresh using git
+
+    if [[ $(which git 2>/dev/null) ]]; then
+      #
+      mkdir -p ~/.ssh
+      ssh-keyscan "github.com" >> ~/.ssh/known_hosts 2>/dev/null
+      # git is installed
+      remote=$(git status | grep "Your branch" | egrep -o "[^']*/${GITHUB_BRANCH}\>" | sed 's#/.*##')
+      if [[ $remote != "" ]]; then
+        # current branch points to the remote $GITHUB_BRANCH branch
+        uri=$(git remote -v | egrep "^ *$remote\s.*\(fetch\)" | awk '{print $2}')
+        if [[ $uri =~ "$GITHUB_REPO" ]]; then
+          # remote repo is the official repo
+          git fetch > /dev/null 2>&1 || true
+          if [[ $(git status) =~ "Your branch is up to date" ]]; then
+            echo "edge2ai-workshop repo is up to date."
+            return
+          elif [[ $(git status) =~ "can be fast-forwarded" ]]; then
+            echo "$C_RED"
+            echo "There is an update available for the edge2ai-workshop."
+            echo -n "Do you want to refresh your local repo now? (y|n) $C_NORMAL"
+            read confirm
+            if [[ $confirm == Y || $confirm == y ]]; then
+              git reset --hard || true
+              git pull || true
+              if [[ $(git status) =~ "Your branch is up to date" ]]; then
+                echo "$C_YELLOW"
+                echo "   Congratulations! The update completed successfully! Please run the launch command again."
+                echo "$C_NORMAL"
+              else
+                echo "$C_RED"
+                echo "Oops! Apparently something went wrong during the update."
+                echo "Try refreshing it manually with the commands below and run launch again when finished:"
+                echo ""
+                echo "   git fetch"
+                echo "   git pull"
+                echo "$C_NORMAL"
+              fi
+              exit
+            fi
+            return
+          fi
+        fi
+      fi
+    fi
+
+    # Cannot use git. Will check using curl and suggest manual refresh is needed
+
+    # Get current build timestamp
+    dir=$PWD
+    while [[ $dir != / && ! -f $dir/$BUILD_FILE ]]; do
+      dir=$(dirname $dir)
+    done
+    this_build=$(head -1 $dir/$BUILD_FILE 2>/dev/null | grep -o "^[0-9]\{14\}" | head -1)
+    latest_build=$(curl "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/$BUILD_FILE" 2>/dev/null | head -1 | grep -o "^[0-9]\{14\}" | head -1)
+    if [[ $latest_build != "" ]]; then
+      if [[ $this_build == "" || $this_build < $latest_build ]]; then
+        echo "$C_RED"
+        echo "There is an update available for the edge2ai-workshop."
+        echo "Please check the GitHub repository below and get the latest version from there:"
+        echo ""
+        echo "   https://github.com/$GITHUB_REPO/"
+        echo ""
+        echo -n "Do you want to perform the update now? (Y|n) $C_NORMAL"
+        read confirm
+        if [[ $confirm == Y || $confirm == y ]]; then
+          echo "Ok. Please re-run the launch command after you finish the update."
+          exit
+        fi
+      else
+        echo "edge2ai-workshop repo is up to date."
+      fi
+    else
+      echo "Cannot check for updates now. Continuing with the current version."
+    fi
+  fi
+}
+
+function check_stack_version() {
+  if [[ ! -f $BASE_DIR/NO_VERSION_CHECK ]]; then
+    # Get last check timestamp
+    last_stack_check=$(head -1 $LAST_STACK_CHECK_FILE 2>/dev/null | grep -o "^[0-9]\{14\}" | head -1)
+    latest_stack=$(curl "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/$STACK_BUILD_FILE" 2>/dev/null | head -1 | grep -o "^[0-9]\{14\}" | head -1)
+    echo "$latest_stack" > $LAST_STACK_CHECK_FILE
+    if [[ $latest_stack != "" ]]; then
+      if [[ $last_stack_check == "" || $last_stack_check < $latest_stack ]]; then
+        echo "$C_YELLOW"
+        echo "There are new STACK definitions available at the URL below (VPN required):"
+        echo ""
+        echo "   http://tiny.cloudera.com/workshop-templates/"
+        echo ""
+        echo "Please consider downloading and updating your stack files to the latest ones."
+        echo ""
+        echo -n "Do you want to proceed with the launch now? (y|N) $C_NORMAL"
+        read confirm
+        if [[ $confirm != Y && $confirm != y ]]; then
+          echo "Ok. Please re-run the launch command after you finish the stack update."
+          exit
+        fi
+      fi
+    fi
+  fi
 }
 
 function _find_docker_image() {
@@ -41,7 +163,7 @@ function check_docker_launch() {
     if [ "$docker_img" != "" ]; then
       local cmd=./$(basename $0)
       echo -e "${C_DIM}Using docker image: ${docker_img}${C_NORMAL}"
-      exec docker run -ti --rm --entrypoint="" -v $BASE_DIR:/edge2ai-workshop/setup/terraform $docker_img $cmd $*
+      exec docker run -ti --rm --entrypoint="" -v $BASE_DIR/../..:/edge2ai-workshop $docker_img $cmd $*
     fi
   fi
   if [ "${EDGE2AI_DOCKER_IMAGE:-}" != "" ]; then
@@ -54,9 +176,9 @@ function check_docker_launch() {
 }
 
 function check_env_files() {
-  if [ -f $BASE_DIR/.env.default ]; then
+  if [[ -f $BASE_DIR/.env.default ]]; then
     echo 'ERROR: An enviroment file cannot be called ".env.default". Please renamed it to ".env".'
-    exit 1
+    abort
   fi
 }
 
@@ -103,14 +225,14 @@ function load_env() {
 
   check_env_files
 
-  if [ ! -f $env_file ]; then
+  if [[ ! -f $env_file ]]; then
     echo ""
     echo "The namespace [$namespace] has not been configured."
     echo "1. Create the environment by copying the environment template:"
     echo "     cp .env.template .env.<namespace_name>"
     echo "2. Review and configure .env.<namespace_name> appropriately."
     echo ""
-    exit 1
+    abort
   fi
   source $env_file
   export NAMESPACE=$namespace
@@ -127,6 +249,14 @@ function load_env() {
   export TF_VAR_web_ssh_private_key=$NAMESPACE_DIR/${TF_VAR_web_key_name}.pem
   export TF_VAR_web_ssh_public_key=$NAMESPACE_DIR/${TF_VAR_web_key_name}.pem.pub
   export TF_VAR_my_public_ip=$(curl -sL ifconfig.me || curl -sL ipapi.co/ip || curl -sL icanhazip.com)
+
+  TF_VAR_use_elastic_ip=$(echo "${TF_VAR_use_elastic_ip:-FALSE}" | tr A-Z a-z)
+  if [ "$TF_VAR_use_elastic_ip" == "yes" -o "$TF_VAR_use_elastic_ip" == "true" -o "$TF_VAR_use_elastic_ip" == "1" ]; then
+    TF_VAR_use_elastic_ip=true
+  else
+    TF_VAR_use_elastic_ip=false
+  fi
+  export TF_VAR_use_elastic_ip
 }
 
 function get_namespaces() {
@@ -240,7 +370,7 @@ function check_for_jq() {
     echo "ERROR: The "jq" tool is not installed and it is required."
     echo "       Please install jq and try again. Check the documentation for"
     echo "       more details."
-    exit 1
+    abort
   fi
 }
 
@@ -254,13 +384,14 @@ function check_file_staleness() {
   for var in $base_variables; do
     grep -E "^ *(export){0,1} *$var=" $compare > /dev/null
     if [ $? != 0 ]; then
-      echo "ERROR: Configuration file $compare is missing property ${var}." > /dev/stderr
-      stale=1
+      line=$(grep "^ *export  *$var=" $basefile)
+      echo "${line}" >> $compare
+      echo "${C_BLUE}INFO: Configuration file $compare has been updated with the following property: ${line}.${C_NORMAL}" >&2
     fi
   done
   not_set=$(grep -E "^ *(export){0,1} *[a-zA-Z0-9_]*=" $compare | sed -E 's/ *(export){0,1} *//;s/="?<[A-Z_]*>"?$/=/g;s/""//g' | egrep "CHANGE_ME|REPLACE_ME|=$" | sed 's/=//' | tr "\n" "," | sed 's/,$//')
   if [ "$not_set" != "" ]; then
-    echo "ERROR: Configuration file $compare has the following unset properties: ${not_set}." > /dev/stderr
+    echo "${C_RED}ERROR: Configuration file $compare has the following unset properties: ${not_set}.${C_NORMAL}" >&2
     stale=1
   fi
   set -e
@@ -275,19 +406,23 @@ function presign_urls() {
 function validate_env() {
   local template_file=$BASE_DIR/.env.template
   local compare_file=$(get_env_file_path $NAMESPACE)
+  if [[ $compare_file != "" && ! -f $compare_file ]]; then
+    echo "${C_RED}ERROR: The specified enviroment file ($compare_file) does not exist.${C_NORMAL}" >&2
+    abort
+  fi
   if [ ! -f $template_file ]; then
-    echo "ERROR: Cannot find the template file $template_file." > /dev/stderr
-    exit 1
+    echo "${C_RED}ERROR: Cannot find the template file $template_file.${C_NORMAL}" >&2
+    abort
   fi
   if [ "$(check_file_staleness $template_file $compare_file)" != "0" ]; then
-      cat > /dev/stderr <<EOF
+      cat >&2 <<EOF
 
-ERROR: Please fix the problems above in the file $compare_file and try again.
+${C_RED}ERROR: Please fix the problems above in the file $compare_file and try again.${C_NORMAL}
        If this configuration was working before, you may have upgraded to a new version
        of the workshop that requires additional properties.
        You can refer to the template $template_file for a list of all the required properties.
 EOF
-      exit 1
+      abort
   fi
 }
 
@@ -296,8 +431,34 @@ function kerb_auth_for_cluster() {
   local public_dns=$(public_dns $cluster_id)
   if [ "$ENABLE_KERBEROS" == "yes" ]; then
     export KRB5_CONFIG=$NAMESPACE_DIR/krb5.conf.$cluster_id
-    scp -q -o StrictHostKeyChecking=no -i $TF_VAR_ssh_private_key $TF_VAR_ssh_username@$public_dns:/etc/krb5.conf $KRB5_CONFIG
-    sed -i.bak "s/kdc *=.*internal/kdc = $public_dns/;s/admin_server *=.*internal/admin_server = $public_dns/;/includedir/ d" $KRB5_CONFIG
+    cat > $KRB5_CONFIG <<EOF
+[logging]
+ default = FILE:/var/log/krb5libs.log
+ kdc = FILE:/var/log/krb5kdc.log
+ admin_server = FILE:/var/log/kadmind.log
+
+[libdefaults]
+ dns_lookup_realm = false
+ ticket_lifetime = 24h
+ renew_lifetime = 7d
+ forwardable = true
+ rdns = false
+ pkinit_anchors = FILE:/etc/pki/tls/certs/ca-bundle.crt
+ default_realm = WORKSHOP.COM
+ udp_preference_limit = 1
+ kdc_timeout = 3
+
+[realms]
+ WORKSHOP.COM = {
+  kdc = tcp/$public_dns
+  kdc = $public_dns
+  admin_server = $public_dns
+ }
+
+[domain_realm]
+ .workshop.com = WORKSHOP.COM
+ workshop.com = WORKSHOP.COM
+EOF
     export KRB5CCNAME=/tmp/workshop.$$
     echo supersecret1 | kinit workshop 2>&1 | grep -v "Password for" | true
   fi
@@ -313,9 +474,54 @@ print((datetime.strptime('$enddate', '%m%d%Y') - dt).days)
 "
 }
 
+function collect_logs() {
+  local namespace=$1
+  if [[ $namespace == "" ]]; then
+    return
+  fi
+  if [[ $0 != *"/launch.sh" ]]; then
+    return
+  fi
+  no_run=$(grep "^Aborting." $LOG_NAME | wc -l || true)
+  if [[ $no_run -gt 0 ]]; then
+    return
+  fi
+  success=$(grep "Deployment completed successfully" $LOG_NAME | wc -l || true)
+  if [[ $success -eq 1 ]]; then
+    return
+  fi
+  load_env "$namespace"
+  local tmp_file=/tmp/list-details.$$
+  local log_name=""
+  set +e
+  $BASE_DIR/list-details.sh "$namespace" > $tmp_file 2>/dev/null
+  echo "Collecting logs:"
+  grep "${namespace}-web" $tmp_file | awk '{print $2}' | while read host_name; do
+    log_name=${LOG_NAME}.web
+    scp -q -o StrictHostKeyChecking=no -i "$TF_VAR_web_ssh_private_key" $TF_VAR_ssh_username@$host_name:./web/start-web.log "$log_name"
+    if [[ $? == 0 ]]; then
+      echo "  Saved log from web server as $log_name"
+    else
+      echo "  ERROR: Could not download log web/start-web.log from the web server"
+    fi
+  done
+  idx=0
+  grep "${namespace}-cluster" $tmp_file | awk '{print $2}' | while read host_name; do
+    log_name=${LOG_NAME}.cluster-$idx
+    scp -q -o StrictHostKeyChecking=no -i "$TF_VAR_ssh_private_key" $TF_VAR_ssh_username@$host_name:/tmp/resources/setup.log ${LOG_NAME}.cluster-$idx
+    if [[ $? == 0 ]]; then
+      echo "  Saved log from cluster-$idx server as $log_name"
+    else
+      echo "  ERROR: Could not download log /tmp/resources/setup.log from the cluster-$idx server"
+    fi
+    idx=$((idx+1))
+  done
+  rm -f $tmp_file
+}
+
 function set_traps() {
   for sig in {0..16} {18..31}; do
-    trap 'RET=$?; reset_traps; if [ $RET != 0 ]; then echo -e "\n   FAILED!!! (signal: '$sig', exit code: $RET)\n"; fi; set +e; kdestroy > /dev/null 2>&1' $sig
+    trap 'RET=$?; reset_traps; if [ $RET != 0 ]; then echo -e "\n   FAILED!!! (signal: '$sig', exit code: $RET)\n"; fi; collect_logs "${NAMESPACE:-}"; set +e; kdestroy > /dev/null 2>&1' $sig
   done
 }
 
